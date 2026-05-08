@@ -17,7 +17,7 @@ import requests
 
 
 API_BASE_URL = "https://mail.ziiys.com/api/mailboxes"
-MAILBOX_EMAIL = "hf56kd3yud7b@ziiy.eu.cc"
+MAILBOX_EMAIL = "e570syhz6dnb@ziiy.eu.cc"
 ENV_FILE = Path(".env")
 
 
