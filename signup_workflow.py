@@ -33,7 +33,7 @@ MAILBOX_API_BASE_URL = "https://mail.ziiys.com/api/mailboxes"
 SIGNUP_PAGE_URL = "https://www.komilion.com/auth/signup"
 SIGNUP_API_URL = "https://www.komilion.com/api/signup"
 ENV_FILE = Path(".env")
-OUTPUT_FILE = Path("accounts.jsonl")
+OUTPUT_FILE = Path("accounts.json")
 PASSWORD_CHARS = string.ascii_letters + string.digits + "!@#$%^&*_-+="
 MAIL_POLL_INTERVAL_SECONDS = 3
 MAIL_POLL_MAX_RETRIES = 5
@@ -67,6 +67,32 @@ def get_required_env(name: str) -> str:
     return value
 
 
+def get_optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    normalized_value = value.strip()
+    return normalized_value or None
+
+
+def get_optional_bool_env(name: str) -> bool | None:
+    value = get_optional_env(name)
+    if value is None:
+        return None
+
+    normalized_value = value.lower()
+    if normalized_value in {"1", "true", "yes", "on"}:
+        return True
+    if normalized_value in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid boolean environment variable: {name}={value!r}. "
+        "Use one of: true/false, 1/0, yes/no, on/off."
+    )
+
+
 def parse_json_response(response: requests.Response) -> Any:
     try:
         return response.json()
@@ -78,6 +104,17 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def current_time_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S:%f")[:-3]
+
+
+def format_display_time(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S:%f")[:-3]
+    except ValueError:
+        return value
+
+
 def is_debug_enabled() -> bool:
     return os.getenv(DEBUG_ENV_NAME, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -87,8 +124,8 @@ def format_duration(seconds: float) -> str:
 
 
 def print_step(title: str, started_at: float, extra: str | None = None) -> None:
-    now_text = utc_now_iso().replace("T", " ")
-    message = f"[{now_text}] {title} | 当前运行时间: {format_duration(time.perf_counter() - started_at)}"
+    _ = started_at
+    message = f"[{current_time_text()}] {title}"
     if extra:
         message = f"{message} | {extra}"
     print(message)
@@ -243,14 +280,33 @@ def extract_mailbox_email(mailbox_response_body: Any) -> str:
     return email
 
 
+def build_mailbox_payload() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "domain": get_required_env("MAIL_ZIIYS_DOMAIN"),
+    }
+
+    random_value = get_optional_bool_env("MAIL_ZIIYS_RANDOM")
+    local_part = get_optional_env("MAIL_ZIIYS_LOCAL_PART")
+    subdomain = get_optional_env("MAIL_ZIIYS_SUBDOMAIN")
+    random_subdomain = get_optional_bool_env("MAIL_ZIIYS_RANDOM_SUBDOMAIN")
+
+    if local_part:
+        payload["localPart"] = local_part
+        payload["random"] = False if random_value is None else random_value
+    else:
+        payload["random"] = True if random_value is None else random_value
+
+    if subdomain:
+        payload["subdomain"] = subdomain
+    elif random_subdomain is not None:
+        payload["randomSubdomain"] = random_subdomain
+
+    return payload
+
+
 def create_mailbox() -> dict[str, Any]:
     token = get_required_env("MAIL_ZIIYS_TOKEN")
-    domain = get_required_env("MAIL_ZIIYS_DOMAIN")
-
-    payload = {
-        "domain": domain,
-        "random": True,
-    }
+    payload = build_mailbox_payload()
 
     response = requests.post(
         MAILBOX_API_URL,
@@ -433,25 +489,39 @@ def append_account_record(record: dict[str, str | None], path: Path = OUTPUT_FIL
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def run_workflow() -> dict[str, Any]:
+def run_workflow() -> dict[str, Any] | None:
     workflow_started_at = time.perf_counter()
     load_dotenv(ENV_FILE)
 
-    print_step("创建邮箱", workflow_started_at)
     mailbox_result = create_mailbox()
-    print(f"  邮箱: {mailbox_result['mailbox_email']}")
+    print_step("创建邮箱", workflow_started_at, extra=f"邮箱: {mailbox_result['mailbox_email']}")
     print_debug_block("create_mailbox", mailbox_result)
 
-    print_step("生成注册资料", workflow_started_at)
     credentials = build_credentials(mailbox_result["mailbox_email"])
-    print(f"  Name: {credentials['name']}")
-    print(f"  Email: {credentials['email']}")
-    print(f"  Password: {credentials['password']}")
+    print_step(
+        "生成注册资料",
+        workflow_started_at,
+        extra=(
+            f"Name: {credentials['name']} | "
+            f"Email: {credentials['email']} | "
+            f"Password: {credentials['password']}"
+        ),
+    )
 
-    print_step("执行注册请求", workflow_started_at)
     signup_result = signup(credentials)
-    print(f"  注册响应状态: {signup_result['response']['status_code']}")
+    signup_status_code = signup_result["response"]["status_code"]
+    signup_response_body = signup_result["response"]["body"]
+    print_step("执行注册请求", workflow_started_at, extra=f"注册响应状态: {signup_status_code}")
     print_debug_block("signup", signup_result)
+
+    if signup_status_code == 400:
+        error_message = (
+            json.dumps(signup_response_body, ensure_ascii=False)
+            if isinstance(signup_response_body, (dict, list))
+            else str(signup_response_body)
+        )
+        print_step("注册失败", workflow_started_at, extra=f"错误信息: {error_message}")
+        return None
 
     latest_message_poll = poll_latest_message(credentials["email"], workflow_started_at=workflow_started_at)
 
@@ -480,10 +550,13 @@ def run_workflow() -> dict[str, Any]:
 
 def main() -> None:
     result = run_workflow()
+    if result is None:
+        return
+
     summary = result["summary"]
 
     print("\n=== 执行摘要 ===")
-    print(f"创建时间: {summary['created_at']}")
+    print(f"创建时间: {format_display_time(summary['created_at'])}")
     print(f"执行耗时: {summary['execution_time_seconds']}s")
     print(f"邮箱: {summary['mailbox_email']}")
     print(f"姓名: {summary['name']}")
