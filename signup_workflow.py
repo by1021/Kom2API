@@ -7,7 +7,7 @@ Flow:
 2. Generate signup name and password
 3. Use the created mailbox email for Komilion signup
 4. Save account information to a local JSONL file
-5. Poll latest mailbox message every 3 seconds, up to 3 attempts
+5. Poll latest mailbox message every 5 seconds, up to 5 attempts
 """
 
 from __future__ import annotations
@@ -32,10 +32,12 @@ MAILBOX_API_URL = "https://mail.ziiys.com/api/mailboxes"
 MAILBOX_API_BASE_URL = "https://mail.ziiys.com/api/mailboxes"
 SIGNUP_PAGE_URL = "https://www.komilion.com/auth/signup"
 SIGNUP_API_URL = "https://www.komilion.com/api/signup"
+DASHBOARD_URL = "https://www.komilion.com/dashboard"
+API_KEYS_URL = "https://www.komilion.com/api/user/api-keys?reveal=true"
 ENV_FILE = Path(".env")
 OUTPUT_FILE = Path("accounts.json")
 PASSWORD_CHARS = string.ascii_letters + string.digits + "!@#$%^&*_-+="
-MAIL_POLL_INTERVAL_SECONDS = 3
+MAIL_POLL_INTERVAL_SECONDS = 5
 MAIL_POLL_MAX_RETRIES = 5
 REQUEST_TIMEOUT = 30
 VERIFY_EMAIL_URL_HINT = "/api/auth/verify-email?token="
@@ -213,15 +215,24 @@ def build_latest_message_headers(token: str) -> dict[str, str]:
     }
 
 
-def build_signup_headers() -> dict[str, str]:
+def build_browser_headers(referer: str) -> dict[str, str]:
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9",
-        "Content-Type": "application/json",
-        "Origin": "https://www.komilion.com",
-        "Referer": SIGNUP_PAGE_URL,
+        "Referer": referer,
     }
+
+
+def build_signup_headers() -> dict[str, str]:
+    headers = build_browser_headers(SIGNUP_PAGE_URL)
+    headers.update(
+        {
+            "Content-Type": "application/json",
+            "Origin": "https://www.komilion.com",
+        }
+    )
+    return headers
 
 
 def random_name() -> str:
@@ -342,6 +353,8 @@ def build_summary(account_record: dict[str, Any], workflow_started_at: float) ->
         latest_message_body = latest_message.get("response", {}).get("body")
 
     verify_email_url = extract_verify_email_url(latest_message_body)
+    email_verification = account_record.get("email_verification", {})
+    api_key_result = account_record.get("api_key", {})
 
     return {
         "created_at": account_record["created_at"],
@@ -353,10 +366,14 @@ def build_summary(account_record: dict[str, Any], workflow_started_at: float) ->
         "mail_poll_success": account_record["latest_message_poll"]["success"],
         "mail_poll_attempt_count": len(account_record["latest_message_poll"]["attempts"]),
         "verify_email_url": verify_email_url,
+        "email_verification_success": email_verification.get("success", False),
+        "verified_redirect_url": email_verification.get("final_url"),
+        "api_key_fetch_success": api_key_result.get("success", False),
+        "api_key": api_key_result.get("api_key"),
     }
 
 
-def signup(credentials: dict[str, str]) -> dict[str, Any]:
+def signup(session: requests.Session, credentials: dict[str, str]) -> dict[str, Any]:
     payload = {
         "name": credentials["name"],
         "email": credentials["email"],
@@ -364,7 +381,7 @@ def signup(credentials: dict[str, str]) -> dict[str, Any]:
         "acceptTerms": True,
     }
 
-    response = requests.post(
+    response = session.post(
         SIGNUP_API_URL,
         headers=build_signup_headers(),
         json=payload,
@@ -384,6 +401,61 @@ def signup(credentials: dict[str, str]) -> dict[str, Any]:
             "headers": dict(response.headers),
             "body": response_body,
         },
+    }
+
+
+def fetch_api_key(session: requests.Session, referer: str) -> dict[str, Any]:
+    response = session.get(
+        API_KEYS_URL,
+        headers=build_browser_headers(referer),
+        timeout=REQUEST_TIMEOUT,
+    )
+    response_body = parse_json_response(response)
+    api_key = response_body.get("apiKey") if isinstance(response_body, dict) else None
+
+    return {
+        "success": response.status_code < 400 and bool(api_key),
+        "api_key": api_key,
+        "request": {
+            "url": API_KEYS_URL,
+            "method": "GET",
+            "headers": dict(response.request.headers),
+            "body": None,
+        },
+        "response": {
+            "status_code": response.status_code,
+            "headers": dict(response.headers),
+            "body": response_body,
+        },
+    }
+
+
+def verify_email_and_fetch_api_key(session: requests.Session, verify_email_url: str) -> dict[str, Any]:
+    verify_response = session.get(
+        verify_email_url,
+        headers=build_browser_headers(SIGNUP_PAGE_URL),
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+    verify_response_body = parse_json_response(verify_response)
+    final_url = verify_response.url or DASHBOARD_URL
+    api_key_result = fetch_api_key(session, referer=final_url)
+
+    return {
+        "success": verify_response.status_code < 400 and api_key_result["success"],
+        "final_url": final_url,
+        "verify_request": {
+            "url": verify_email_url,
+            "method": "GET",
+            "headers": dict(verify_response.request.headers),
+            "body": None,
+        },
+        "verify_response": {
+            "status_code": verify_response.status_code,
+            "headers": dict(verify_response.headers),
+            "body": verify_response_body,
+        },
+        "api_key_result": api_key_result,
     }
 
 
@@ -446,7 +518,7 @@ def poll_latest_message(
 
         print_debug_block(f"latest_message_attempt_{attempt}", latest_message_result)
 
-        if status_code < 400 and response_body not in (None, "", [], {}):
+        if status_code < 400 and verify_email_url:
             return {
                 "success": True,
                 "attempts": attempts,
@@ -480,11 +552,11 @@ def build_output_record(account_record: dict[str, Any]) -> dict[str, str | None]
     return {
         "email": summary["mailbox_email"],
         "password": summary["password"],
-        "url": summary["verify_email_url"],
+        "api_key": summary["api_key"],
     }
 
 
-def append_account_record(record: dict[str, str | None], path: Path = OUTPUT_FILE) -> None:
+def append_account_record(record: dict[str, str | bool | None], path: Path = OUTPUT_FILE) -> None:
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -508,22 +580,44 @@ def run_workflow() -> dict[str, Any] | None:
         ),
     )
 
-    signup_result = signup(credentials)
-    signup_status_code = signup_result["response"]["status_code"]
-    signup_response_body = signup_result["response"]["body"]
-    print_step("执行注册请求", workflow_started_at, extra=f"注册响应状态: {signup_status_code}")
-    print_debug_block("signup", signup_result)
+    with requests.Session() as session:
+        signup_result = signup(session, credentials)
+        signup_status_code = signup_result["response"]["status_code"]
+        signup_response_body = signup_result["response"]["body"]
+        print_step("执行注册请求", workflow_started_at, extra=f"注册响应状态: {signup_status_code}")
+        print_debug_block("signup", signup_result)
 
-    if signup_status_code == 400:
-        error_message = (
-            json.dumps(signup_response_body, ensure_ascii=False)
-            if isinstance(signup_response_body, (dict, list))
-            else str(signup_response_body)
-        )
-        print_step("注册失败", workflow_started_at, extra=f"错误信息: {error_message}")
-        return None
+        if signup_status_code >= 400:
+            error_message = (
+                json.dumps(signup_response_body, ensure_ascii=False)
+                if isinstance(signup_response_body, (dict, list))
+                else str(signup_response_body)
+            )
+            print_step("注册失败", workflow_started_at, extra=f"错误信息: {error_message}")
+            return None
 
-    latest_message_poll = poll_latest_message(credentials["email"], workflow_started_at=workflow_started_at)
+        latest_message_poll = poll_latest_message(credentials["email"], workflow_started_at=workflow_started_at)
+        verify_email_url = latest_message_poll.get("verify_email_url")
+
+        email_verification_result: dict[str, Any] = {
+            "success": False,
+            "final_url": None,
+            "verify_request": None,
+            "verify_response": None,
+            "api_key_result": {
+                "success": False,
+                "api_key": None,
+                "request": None,
+                "response": None,
+            },
+        }
+
+        if verify_email_url:
+            print_step("执行邮箱验证", workflow_started_at, extra=f"验证链接: {verify_email_url}")
+            email_verification_result = verify_email_and_fetch_api_key(session, verify_email_url)
+            print_debug_block("email_verification", email_verification_result)
+        else:
+            print_step("未获取到验证链接", workflow_started_at)
 
     account_record = {
         "created_at": utc_now_iso(),
@@ -535,6 +629,13 @@ def run_workflow() -> dict[str, Any] | None:
         },
         "signup": signup_result,
         "latest_message_poll": latest_message_poll,
+        "email_verification": {
+            "success": email_verification_result["success"],
+            "final_url": email_verification_result["final_url"],
+            "request": email_verification_result["verify_request"],
+            "response": email_verification_result["verify_response"],
+        },
+        "api_key": email_verification_result["api_key_result"],
     }
 
     summary = build_summary(account_record, workflow_started_at)
@@ -565,6 +666,10 @@ def main() -> None:
     print(f"取信成功: {summary['mail_poll_success']}")
     print(f"取信尝试次数: {summary['mail_poll_attempt_count']}")
     print(f"验证链接: {summary['verify_email_url'] or '未提取到'}")
+    print(f"邮箱验证成功: {summary['email_verification_success']}")
+    print(f"验证后跳转: {summary['verified_redirect_url'] or '未获取到'}")
+    print(f"API Key 获取成功: {summary['api_key_fetch_success']}")
+    print(f"API Key: {summary['api_key'] or '未获取到'}")
 
     if is_debug_enabled():
         print("\n=== DEBUG: full_result ===")
